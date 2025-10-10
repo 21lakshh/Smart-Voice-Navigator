@@ -9,9 +9,11 @@ from livekit.plugins import (
     google,
     openai,
     )
+from livekit.agents.llm import function_tool
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Annotated
+from pydantic import Field
 import yaml
 
 logger = logging.getLogger(__name__)
@@ -20,20 +22,18 @@ load_dotenv()
 
 @dataclass
 class UserData:
-    object_to_find: str
+    object_to_find: Optional[str] = None
     user_location: Optional[str] = None
     object_found: bool = False
-    object_location: Optional[str] = None
     object_image: Optional[str] = None
     prev_agent: Optional[Agent] = None
     agents: dict[str, Agent] = field(default_factory=dict)
 
     def summarize(self) -> str:
         data = {
-            "object_to_find": self.object_to_find or "nothing",
+            "object_to_find": self.object_to_find or "unknown",
             "user_location": self.user_location or "unknown",
             "object_found": self.object_found,
-            "object_location": self.object_location or "unknown",
             "object_image": self.object_image or "no image",
             "prev_agent": self.prev_agent or "no previous agent"
         }
@@ -67,24 +67,159 @@ class BaseAgent(Agent):
         await self.update_chat_ctx(chat_ctx)
         self.session.generate_reply(tool_choice="none")
 
-    async def _transfer_to_agent(self, name: str, context: RunContext_T) -> tuple[Agent, str]:
-        userdata = context.userdata
-        current_agent = context.session.current_agent
+    async def _transfer_to_agent(self, name: str, context: Optional[RunContext_T] = None) -> tuple[Agent, str]:
+        if context is None:
+            # Called from lifecycle method, use self.session
+            userdata = self.session.userdata
+            current_agent = self.session.current_agent
+        else:
+            # Called from function tool, use provided context
+            userdata = context.userdata
+            current_agent = context.session.current_agent
+        
         next_agent = userdata.agents[name]
         userdata.prev_agent = current_agent
 
         return next_agent, f"Transferring to {name}."
 
 class Greeting(BaseAgent):
-    pass
+    def __init__(self) -> None:
+        super().__init__(
+            instructions=(
+                "You're a calm, real-time smart voice navigator based inside a user's house. Collect the user's target item and user's location, confirm what you heard,"
+                " and let them know exactly what you're doing next. Keep responses short, actionable, and conversational."
+            ),
+        )
+    
+    @function_tool()
+    async def update_object_to_find(
+        self, 
+        object_to_find: Annotated[str, Field(description="The object the user wants to find")], 
+        context: RunContext_T) -> str | tuple[Agent, str]:
+        """Called when user provides the object they want to find"""
+        userdata = context.userdata
+        target = object_to_find.strip()
+        userdata.object_to_find = target
+
+        if userdata.user_location:
+            next_agent, _ = await self._transfer_to_agent("object_detection", context)
+            return next_agent, (
+                f"Locked onto {target}. You're in {userdata.user_location}, so I'm spinning up detection now."
+            )
+
+        return "Locked onto {target}. Give me your current location so I can route you through the quickest path.".format(target=target)
+
+    @function_tool()
+    async def update_user_location(
+        self, 
+        user_location: Annotated[str, Field(description="The location of the user")], 
+        context: RunContext_T) -> str | tuple[Agent, str]:
+        """Called when user provides their location"""
+        userdata = context.userdata
+        location = user_location.strip()
+        userdata.user_location = location
+
+        if userdata.object_to_find:
+            next_agent, _ = await self._transfer_to_agent("object_detection", context)
+            return next_agent, (
+                f"Copy that, you're in {location}. Scanning for {userdata.object_to_find} now."
+            )
+
+        return f"Noted—{location}. Tell me what you're hunting for and I'll spin up the right tools."
+
+class ObjectDetectionAgent(BaseAgent):
+    def __init__(self) -> None:
+
+        super().__init__(
+            instructions=(
+                "You handle rapid object detection. Use the latest image and target name from userdata"
+            ),
+        )
+    
+    async def on_enter(self) -> None:
+        await super().on_enter()
+        message = await self._run_detection() 
+        await self.session.say(message)
+     
+    async def _run_detection(self, context: Optional[RunContext_T] = None) -> str:
+        userdata = self.session.userdata if context is None else context.userdata
+        target = userdata.object_to_find
+        predicted_object = "laptop"
+
+        if predicted_object == target:
+            userdata.object_found = True
+            return (
+                f"Found {target}! Want me to estimate the distance?"
+            )
+        userdata.object_found = False
+        return (
+            f"Didn't spot {target} in the current frame. Should I pull up the knowledge base to guide you?"
+        )
+
+    @function_tool()
+    async def detect_object(self, context: RunContext_T) -> tuple[Agent, str]:
+        """Called when user wants to detect the object"""
+        return await self._run_detection(context)
+    
+    @function_tool()
+    async def to_depth_estimation(self, context: RunContext_T) -> tuple[Agent, str]:
+        """Called when user wants to estimate the distance to the object"""
+        return await self._transfer_to_agent("depth_estimation", context)
+    
+    @function_tool()
+    async def to_rag(self, context: RunContext_T) -> tuple[Agent, str]:
+        """Called when user wants to search for the object in the knowledge base"""
+        return await self._transfer_to_agent("rag", context)
+
+class RAGAgent(BaseAgent):
+    def __init__(self) -> None:
+        super().__init__(
+            instructions=(
+                "You're the fallback navigator. Pull from building knowledge to guide the user to the target"
+                " if detection missed it. Be definitive about directions and confirm next steps."
+            ),
+        )
+
+class DepthEstimationAgent(BaseAgent):
+    def __init__(self) -> None:
+        super().__init__(
+            instructions=(
+                "You estimate distance to the detected object. Use userdata for the target and latest image"
+                " and tell the user the distance plus any movement suggestion."
+            ),
+        )
+    async def on_enter(self) -> None:
+        await super().on_enter()
+        message = await self.estimate_depth()
+        await self.session.say(message)
+
+
+    async def estimate_depth(self, context: Optional[RunContext_T] = None) -> str:
+        """Called when user wants to estimate the distance to the object"""
+        userdata = userdata = self.session.userdata if context is None else context.userdata
+        object_to_find = userdata.object_to_find
+        image = userdata.object_image
+        predicted_depth = 10
+        return f"{object_to_find} is about {predicted_depth} meters ahead. Close in carefully." if object_to_find else "Can't gauge distance without a target."
 
 
 async def entrypoint(ctx: agents.JobContext):
 
-    greeting = Greeting()
+    userdata = UserData()
+
+    userdata.object_image = "assets/image.jpg"
+
+    userdata.agents.update(
+        {
+            "greeter": Greeting(),
+            "object_detection": ObjectDetectionAgent(),
+            "rag": RAGAgent(),
+            "depth_estimation": DepthEstimationAgent(),
+        }
+    )
 
     session = AgentSession(
-          stt = openai.STT(
+        stt = openai.STT(
         model="gpt-4o-transcribe",
         language="en",
         ),  
@@ -95,11 +230,12 @@ async def entrypoint(ctx: agents.JobContext):
         ),
         vad=silero.VAD.load(),
         turn_detection=MultilingualModel(),
+        userdata=userdata
     )
 
     await session.start(
         room=ctx.room,
-        agent=greeting,
+        agent=userdata.agents["greeter"],
         room_input_options=RoomInputOptions(
             noise_cancellation=noise_cancellation.BVC(),
         ),
