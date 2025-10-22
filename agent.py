@@ -15,7 +15,8 @@ from dataclasses import dataclass, field
 from typing import Optional, Annotated
 from pydantic import Field
 import yaml
-
+from ultralytics import YOLO
+import os
 logger = logging.getLogger(__name__)
 
 load_dotenv()
@@ -144,13 +145,20 @@ class ObjectDetectionAgent(BaseAgent):
     async def _run_detection(self, context: Optional[RunContext_T] = None) -> str:
         userdata = self.session.userdata if context is None else context.userdata
         target = userdata.object_to_find
-        predicted_object = "laptop"
 
-        if predicted_object == target:
-            userdata.object_found = True
-            return (
-                f"Found {target}! Want me to estimate the distance?"
-            )
+        model = YOLO("yolo11n.pt")
+        results = model(userdata.object_image)
+
+        for result in results:
+            names = [result.names[cls.item()] for cls in result.boxes.cls.int()]
+        logger.info(f"Names: {names}")
+
+        for name in names:
+            if name == target:
+                userdata.object_found = True
+                return (
+                    f"Found {target}! Want me to estimate the distance?"
+                )
         userdata.object_found = False
         return (
             f"Didn't spot {target} in the current frame. Should I pull up the knowledge base to guide you?"
@@ -185,7 +193,6 @@ class DepthEstimationAgent(BaseAgent):
         super().__init__(
             instructions=(
                 "You estimate distance to the detected object. Use userdata for the target and latest image"
-                " and tell the user the distance plus any movement suggestion."
             ),
         )
     async def on_enter(self) -> None:
@@ -207,7 +214,9 @@ async def entrypoint(ctx: agents.JobContext):
 
     userdata = UserData()
 
-    userdata.object_image = "assets/image.jpg"
+    cwd = os.getcwd()
+    filepath = os.path.join(cwd, "data/test.jpg") # in real word case this image will be taken from somewhere like S3 
+    userdata.object_image = filepath
 
     userdata.agents.update(
         {
