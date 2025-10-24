@@ -14,8 +14,10 @@ from livekit.plugins.turn_detector.multilingual import MultilingualModel
 from dataclasses import dataclass, field
 from typing import Optional, Annotated
 from pydantic import Field
+from torch import embedding
 import yaml
 from ultralytics import YOLO
+from sentence_transformers import SentenceTransformer, util
 import os
 logger = logging.getLogger(__name__)
 
@@ -147,18 +149,29 @@ class ObjectDetectionAgent(BaseAgent):
         target = userdata.object_to_find
 
         model = YOLO("yolo11n.pt")
+        embedding_model = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
+
         results = model(userdata.object_image)
 
         for result in results:
             names = [result.names[cls.item()] for cls in result.boxes.cls.int()]
-        logger.info(f"Names: {names}")
+        logger.info(f"Predicted Object list from the list: {names}")
 
-        for name in names:
-            if name == target:
-                userdata.object_found = True
-                return (
-                    f"Found {target}! Want me to estimate the distance?"
-                )
+        query_embedding = embedding_model.encode(target, convert_to_tensor=True)
+        predicted_embeddings = embedding_model.encode(names, convert_to_tensor=True)
+
+        similarities = util.cos_sim(query_embedding, predicted_embeddings)[0]
+        best_idx = int(similarities.argmax())
+        best_match = names[best_idx]
+        best_score = float(similarities[best_idx])
+
+        logger.info(f"Best match: {best_match} (Score: {best_score:.3f})")
+
+        if best_score >= 0.6:
+            userdata.object_found = True
+            return (
+                f"I have found {best_match}, which matches your request for {target}. Want me to estiamte the distance?"
+            )
         userdata.object_found = False
         return (
             f"Didn't spot {target} in the current frame. Should I pull up the knowledge base to guide you?"
